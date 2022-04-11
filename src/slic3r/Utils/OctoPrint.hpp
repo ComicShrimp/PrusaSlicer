@@ -8,6 +8,7 @@
 #include "PrintHost.hpp"
 #include "libslic3r/PrintConfig.hpp"
 
+class boost::asio::ip::address;
 
 namespace Slic3r {
 
@@ -35,6 +36,9 @@ public:
 
 protected:
     virtual bool validate_version_text(const boost::optional<std::string> &version_text) const;
+#ifdef WIN32
+    virtual bool upload_inner(PrintHostUpload upload_data, ProgressFn prorgess_fn, ErrorFn error_fn, const std::vector<boost::asio::ip::address>& resolved_addr) const;
+#endif
 
 private:
     std::string m_host;

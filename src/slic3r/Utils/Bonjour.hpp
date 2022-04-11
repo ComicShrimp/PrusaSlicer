@@ -25,12 +25,15 @@ struct BonjourReply
 
 	TxtData txt_data;
 
+	std::vector<char> buffer;
+
 	BonjourReply() = delete;
 	BonjourReply(boost::asio::ip::address ip,
 		uint16_t port,
 		std::string service_name,
 		std::string hostname,
-		TxtData txt_data);
+		TxtData txt_data,
+		const std::vector<char>& buffer);
 
 	std::string path() const;
 
@@ -49,6 +52,7 @@ public:
 	typedef std::shared_ptr<Bonjour> Ptr;
 	typedef std::function<void(BonjourReply &&)> ReplyFn;
 	typedef std::function<void()> CompleteFn;
+	typedef std::function<void(const std::vector<BonjourReply>&)> ResolveFn;
 	typedef std::set<std::string> TxtKeys;
 
 	Bonjour(std::string service);
@@ -65,11 +69,20 @@ public:
 	// ^ Note: By default there is 1 retry (meaning 1 broadcast is sent).
 	// Timeout is per one retry, ie. total time spent listening = retries * timeout.
 	// If retries > 1, then care needs to be taken as more than one reply from the same service may be received.
+	
+	// sets hostname queried by resolve()
+	Bonjour& set_hostname(const std::string& hostname);
 
 	Bonjour& on_reply(ReplyFn fn);
 	Bonjour& on_complete(CompleteFn fn);
 
+	Bonjour& on_resolve(ResolveFn fn);
+
 	Ptr lookup();
+	// alternative to lookup, sends query with hostname
+	Ptr resolve();
+	// resolve on the current thread
+	void resolve_sync();
 private:
 	std::unique_ptr<priv> p;
 };

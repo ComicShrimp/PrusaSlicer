@@ -13,6 +13,7 @@
 #include <boost/asio.hpp>
 #include <boost/date_time/posix_time/posix_time_duration.hpp>
 #include <boost/format.hpp>
+#include <boost/thread.hpp>
 
 using boost::optional;
 using boost::system::error_code;
@@ -238,6 +239,7 @@ struct DnsRR_A
 	enum { TAG = 0x1 };
 
 	asio::ip::address_v4 ip;
+	std::string name;
 
 	static void decode(optional<DnsRR_A> &result, const DnsResource &rr)
 	{
@@ -400,6 +402,8 @@ struct DnsMessage
 	optional<DnsRR_AAAA> rr_aaaa;
 	std::vector<DnsRR_SRV> rr_srv;
 
+	optional<DnsResource> answer;
+
 	DnsSDMap sdmap;
 
 	static optional<DnsMessage> decode(const std::vector<char> &buffer, const Bonjour::TxtKeys &txt_keys)
@@ -438,8 +442,16 @@ private:
 	void parse_rr(const std::vector<char> &buffer, DnsResource &&rr, size_t dataoffset, const Bonjour::TxtKeys &txt_keys)
 	{
 		switch (rr.type) {
-			case DnsRR_A::TAG: DnsRR_A::decode(this->rr_a, rr); break;
-			case DnsRR_AAAA::TAG: DnsRR_AAAA::decode(this->rr_aaaa, rr); break;
+			case DnsRR_A::TAG: 
+				DnsRR_A::decode(this->rr_a, rr); 
+				// todo: save name to rr_a
+				this->answer = rr; 
+				break;
+			case DnsRR_AAAA::TAG: 
+				// todo: save name to rr_aaaa
+				DnsRR_AAAA::decode(this->rr_aaaa, rr); 
+				this->answer = rr; 
+				break;
 			case DnsRR_SRV::TAG: {
 				auto srv = DnsRR_SRV::decode(buffer, rr, dataoffset);
 				if (srv) { this->sdmap.insert_srv(std::move(rr.name), std::move(*srv)); }
@@ -484,20 +496,23 @@ std::ostream& operator<<(std::ostream &os, const DnsMessage &msg)
 struct BonjourRequest
 {
 	static const asio::ip::address_v4 MCAST_IP4;
+//	static const asio::ip::address_v6 MCAST_IP6;
 	static const uint16_t MCAST_PORT;
 
 	std::vector<char> data;
 
-	static optional<BonjourRequest> make(const std::string &service, const std::string &protocol);
-
+	static optional<BonjourRequest> make_PTR(const std::string &service, const std::string &protocol);
+	static optional<BonjourRequest> make_A(const std::string& hostname);
+	static optional<BonjourRequest> make_AAAA(const std::string& hostname);
 private:
 	BonjourRequest(std::vector<char> &&data) : data(std::move(data)) {}
 };
 
-const asio::ip::address_v4 BonjourRequest::MCAST_IP4{0xe00000fb};
+const asio::ip::address_v4 BonjourRequest::MCAST_IP4{ 0xe00000fb };
+//const asio::ip::address_v6 BonjourRequest::MCAST_IP6 = asio::ip::make_address_v6("ff02::fb");
 const uint16_t BonjourRequest::MCAST_PORT = 5353;
 
-optional<BonjourRequest> BonjourRequest::make(const std::string &service, const std::string &protocol)
+optional<BonjourRequest> BonjourRequest::make_PTR(const std::string &service, const std::string &protocol)
 {
 	if (service.size() > 15 || protocol.size() > 15) {
 		return boost::none;
@@ -535,6 +550,79 @@ optional<BonjourRequest> BonjourRequest::make(const std::string &service, const 
 	return BonjourRequest(std::move(data));
 }
 
+optional<BonjourRequest> BonjourRequest::make_A(const std::string& hostname)
+{
+	// todo: why is this and what is real max
+	if (hostname.size() > 30) {
+		return boost::none;
+	}
+
+	std::vector<char> data;
+	data.reserve(hostname.size() + 18);
+
+	// Add metadata
+	static const unsigned char rq_meta[] = {
+		0x00, 0x00, // Query ID (zero for mDNS)
+		0x00, 0x00, // Flags
+		0x00, 0x01, // One query
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00   // Zero Answer, Authority, and Additional RRs
+		, 0x10 // todo why?
+	};
+	std::copy(rq_meta, rq_meta + sizeof(rq_meta), std::back_inserter(data));
+
+	// Add A query name
+	//data.push_back(hostname.size() + 1);
+	// trimming .local bad way for now
+	data.insert(data.end(), hostname.begin(), hostname.end() - 6);
+	
+	// Add the rest of A record
+	static const unsigned char ptr_tail[] = {
+		0x05, // length of "label"
+		0x6c, 0x6f, 0x63, 0x61, 0x6c, // "label" string and terminator
+		0x00, 0x00, 0x01, // Type A
+		0x00, 0x01, // Class - 1 is internet 0xff is any
+	};
+	std::copy(ptr_tail, ptr_tail + sizeof(ptr_tail), std::back_inserter(data));
+
+	return BonjourRequest(std::move(data));
+}
+
+optional<BonjourRequest> BonjourRequest::make_AAAA(const std::string& hostname)
+{
+	// todo: why is this and what is real max
+	if (hostname.size() > 30) {
+		return boost::none;
+	}
+
+	std::vector<char> data;
+	data.reserve(hostname.size() + 18);
+
+	// Add metadata
+	static const unsigned char rq_meta[] = {
+		0x00, 0x00, // Query ID (zero for mDNS)
+		0x00, 0x00, // Flags
+		0x00, 0x01, // One query
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00   // Zero Answer, Authority, and Additional RRs
+		, 0x10
+	};
+	std::copy(rq_meta, rq_meta + sizeof(rq_meta), std::back_inserter(data));
+
+	// Add A query name
+	//data.push_back(hostname.size() + 1);
+	// trimming .local bad way for now
+	data.insert(data.end(), hostname.begin(), hostname.end() - 6);
+
+	// Add the rest of A record
+	static const unsigned char ptr_tail[] = {
+		0x05, // length of "label"
+		0x6c, 0x6f, 0x63, 0x61, 0x6c, // "label" string and terminator
+		0x00, 0x00, 0x1c, // Type AAAA
+		0x00, 0x01, // Class - 1 is internet 0xff is any // todo: which class?
+	};
+	std::copy(ptr_tail, ptr_tail + sizeof(ptr_tail), std::back_inserter(data));
+
+	return BonjourRequest(std::move(data));
+}
 
 // API - private part
 
@@ -546,17 +634,23 @@ struct Bonjour::priv
 	TxtKeys txt_keys;
 	unsigned timeout;
 	unsigned retries;
+	std::string hostname;
+
+	std::vector<BonjourReply> replies;
 
 	std::vector<char> buffer;
 	std::thread io_thread;
 	Bonjour::ReplyFn replyfn;
 	Bonjour::CompleteFn completefn;
+	Bonjour::ResolveFn resolvefn;
 
 	priv(std::string &&service);
 
 	std::string strip_service_dn(const std::string &service_name) const;
-	void udp_receive(udp::endpoint from, size_t bytes);
+	void udp_receive_lookup(udp::endpoint from, size_t bytes);
+//	void udp_receive_resolve(udp::endpoint from, size_t bytes);
 	void lookup_perform();
+	void resolve_perform();
 };
 
 Bonjour::priv::priv(std::string &&service)
@@ -582,7 +676,7 @@ std::string Bonjour::priv::strip_service_dn(const std::string &service_name) con
 	}
 }
 
-void Bonjour::priv::udp_receive(udp::endpoint from, size_t bytes)
+void Bonjour::priv::udp_receive_lookup(udp::endpoint from, size_t bytes)
 {
 	if (bytes == 0 || !replyfn) {
 		return;
@@ -611,7 +705,7 @@ void Bonjour::priv::udp_receive(udp::endpoint from, size_t bytes)
 				txt_data = std::move(sdpair.second.txt->data);
 			}
 
-			BonjourReply reply(ip, srv.port, std::move(service_name), srv.hostname, std::move(txt_data));
+			BonjourReply reply(ip, srv.port, std::move(service_name), srv.hostname, std::move(txt_data), buffer);
 			replyfn(std::move(reply));
 		}
 	}
@@ -621,7 +715,7 @@ void Bonjour::priv::lookup_perform()
 {
 	service_dn = (boost::format("_%1%._%2%.local") % service % protocol).str();
 
-	const auto brq = BonjourRequest::make(service, protocol);
+	const auto brq = BonjourRequest::make_PTR(service, protocol);
 	if (!brq) {
 		return;
 	}
@@ -659,7 +753,7 @@ void Bonjour::priv::lookup_perform()
 
 		udp::endpoint recv_from;
 		const auto recv_handler = [&](const error_code &error, size_t bytes) {
-			if (!error) { self->udp_receive(recv_from, bytes); }
+			if (!error) { self->udp_receive_lookup(recv_from, bytes); }
 		};
 		socket.async_receive_from(asio::buffer(buffer, buffer.size()), recv_from, recv_handler);
 
@@ -678,16 +772,204 @@ void Bonjour::priv::lookup_perform()
 	}
 }
 
+class Resolver
+{
+private:
+	std::string hostname;
+	Bonjour::ReplyFn replyfn; // this doesnt call same fn as replyfn of Bonjour class
+	asio::ip::address multicast_address;
+	uint16_t query_type; // DnsRR_A::TAG or DnsRR_AAAA::TAG
+	std::vector<char> buffer;
+	udp::socket socket;
+	udp::endpoint mcast_endpoint;
+	udp::endpoint recv_endpoint;
+public:
+	Resolver(const std::string& hostname, Bonjour::ReplyFn replyfn, const asio::ip::address& multicast_address, uint16_t query_type, boost::shared_ptr< boost::asio::io_service > io_service);
+
+	void send();
+	void async_recieve();
+	void cancel() {socket.cancel();}
+private:
+	void receive_handler(const error_code& error, size_t bytes);
+};
+
+Resolver::Resolver(const std::string& hostname, Bonjour::ReplyFn replyfn, const asio::ip::address& multicast_address, uint16_t query_type, boost::shared_ptr< boost::asio::io_service > io_service)
+	: hostname(hostname)
+	, replyfn(replyfn)
+	, multicast_address(multicast_address)
+	, query_type(query_type)
+	, socket(*io_service)
+{
+	try {
+		// open socket
+		boost::asio::ip::udp::endpoint listen_endpoint(multicast_address.is_v4() ? udp::v4() : udp::v6(), BonjourRequest::MCAST_PORT);
+		socket.open(listen_endpoint.protocol());
+		// set socket to listen
+		socket.set_option(udp::socket::reuse_address(true));
+		socket.bind(listen_endpoint);
+		socket.set_option(boost::asio::ip::multicast::join_group(multicast_address));
+		mcast_endpoint = udp::endpoint(multicast_address, BonjourRequest::MCAST_PORT);
+	} catch (std::exception& e) {
+			BOOST_LOG_TRIVIAL(error) << e.what();
+	}
+}
+
+void Resolver::receive_handler(const error_code& error, size_t bytes)
+{
+	if (error) {
+		// todo: what level? do we even log? There is lot of callbacks when timer runs out
+		//BOOST_LOG_TRIVIAL(error) << error.message();
+		return;
+	}
+	if (bytes == 0 || !replyfn) {
+		// todo: log something?
+		return;
+	}
+	std::vector<char> local_buffer;
+	local_buffer.reserve(bytes);
+	for (size_t i = 0; i < bytes; i++)
+	{
+		local_buffer.push_back(buffer[i]);
+	}
+	//buffer.resize(bytes);
+	// decode buffer, txt keys are not needed for A / AAAA answer
+	auto dns_msg = DnsMessage::decode(local_buffer, Bonjour::TxtKeys());
+	if (dns_msg) {
+		asio::ip::address ip;// = from.address();
+		if (query_type == DnsRR_A::TAG && dns_msg->rr_a) { ip = dns_msg->rr_a->ip; }
+		else if (query_type == DnsRR_AAAA::TAG && dns_msg->rr_aaaa) { ip = dns_msg->rr_aaaa->ip; }
+		else return; // not matching query type with answer type
+		// recieved answer for resolve (A or AAAA querry)
+		if (dns_msg->answer && (dns_msg->answer->type == query_type)) {
+			// todo: upper lower case?
+			if (dns_msg->answer->name == hostname) {
+				// port? service name?
+				BonjourReply reply(ip, 0, std::string(), dns_msg->answer.get().name, BonjourReply::TxtData(), local_buffer);
+				//BOOST_LOG_TRIVIAL(error) << "GOT REPLY " << ip << " " << multicast_address << " " << query_type;
+				replyfn(std::move(reply));
+			}
+		}
+	}
+}
+
+void Resolver::send()
+{
+	try {
+		const auto brq = query_type == DnsRR_A::TAG ? BonjourRequest::make_A(hostname) : BonjourRequest::make_AAAA(hostname);
+		socket.send_to(asio::buffer(brq->data), mcast_endpoint);
+	}
+	catch (std::exception& e) {
+		BOOST_LOG_TRIVIAL(error) << e.what();
+	}
+}
+
+void Resolver::async_recieve()
+{
+	try {
+		
+		buffer.resize(DnsMessage::MAX_SIZE);
+		socket.async_receive_from(asio::buffer(buffer, buffer.size()), recv_endpoint, boost::bind(&Resolver::receive_handler, this, _1 , _2));
+	}
+	catch (std::exception& e) {
+		BOOST_LOG_TRIVIAL(error) << e.what();
+	}
+}
+
+void Bonjour::priv::resolve_perform()
+{
+	
+	// access here should be sequential due to strand or sequential processing
+	std::vector<BonjourReply> replies;
+	const auto reply_callback = [&rpls = replies](BonjourReply&& reply)
+	{
+		if (std::find(rpls.begin(), rpls.end(), reply) == rpls.end()) 
+			rpls.push_back(reply);
+	};
+
+	const asio::ip::address_v6 MCAST_IP6 = asio::ip::make_address_v6("ff02::fb");
+
+	boost::shared_ptr< boost::asio::io_service > io_service(
+		new boost::asio::io_service
+	);
+	// Do we need to strand wrap timer calls? 
+	//boost::shared_ptr< boost::asio::io_service::strand > strand(
+	//	new boost::asio::io_service::strand(*io_service)
+	//);
+
+	std::vector<Resolver*> resolvers;
+	resolvers.emplace_back(new Resolver(hostname, reply_callback, BonjourRequest::MCAST_IP4, DnsRR_A::TAG, io_service));
+	resolvers.emplace_back(new Resolver(hostname, reply_callback, MCAST_IP6, DnsRR_AAAA::TAG, io_service));
+	resolvers.emplace_back(new Resolver(hostname, reply_callback, BonjourRequest::MCAST_IP4, DnsRR_AAAA::TAG, io_service));
+	resolvers.emplace_back(new Resolver(hostname, reply_callback, MCAST_IP6, DnsRR_A::TAG, io_service));
+
+	auto self = this;
+	try{
+		for each (auto* resolver in resolvers)
+			resolver->send();
+
+		// timer settings
+		bool expired = false;
+		bool retry = false;
+		asio::deadline_timer timer(*io_service);
+		retries--;
+		std::function<void(const error_code&)> timer_handler = [&](const error_code& error) {
+			// end 
+			if (retries == 0 || error || !replies.empty()) {
+				expired = true;
+				if (self->resolvefn) {
+					self->resolvefn(replies);
+				}
+			// restart timer
+			} else {
+				retry = true;
+				retries--;
+				timer.expires_from_now(boost::posix_time::seconds(timeout));
+				//timer.async_wait(strand->wrap(timer_handler));
+				timer.async_wait(timer_handler);
+			}
+		};
+		// start timer for 1st try
+		timer.expires_from_now(boost::posix_time::seconds(timeout));
+		//timer.async_wait(strand->wrap(timer_handler));
+		timer.async_wait(timer_handler);
+
+		for each (auto* resolver in resolvers)
+			resolver->async_recieve();
+		
+		while (io_service->run_one()) {
+			if (expired) {
+				for each (auto * resolver in resolvers)
+					resolver->cancel();
+			}
+			else if (retry) {
+				retry = false;
+				for each (auto* resolver in resolvers)
+					resolver->send();
+			}
+			else {
+				for each (auto* resolver in resolvers)
+					resolver->async_recieve();
+			}
+		}
+	}
+	catch (std::exception& e) {
+		BOOST_LOG_TRIVIAL(error) << e.what();
+	}
+}
 
 // API - public part
 
-BonjourReply::BonjourReply(boost::asio::ip::address ip, uint16_t port, std::string service_name, std::string hostname, BonjourReply::TxtData txt_data)
+BonjourReply::BonjourReply(boost::asio::ip::address ip, uint16_t port, std::string service_name, std::string hostname, BonjourReply::TxtData txt_data, const std::vector<char>& buffer)
 	: ip(std::move(ip))
 	, port(port)
 	, service_name(std::move(service_name))
 	, hostname(std::move(hostname))
 	, txt_data(std::move(txt_data))
 {
+	for (const char& ch : buffer)
+	{
+		this->buffer.emplace_back(ch);
+	}
 	std::string proto;
 	std::string port_suffix;
 	if (port == 443) { proto = "https://"; }
@@ -770,6 +1052,12 @@ Bonjour& Bonjour::set_timeout(unsigned timeout)
 	return *this;
 }
 
+Bonjour& Bonjour::set_hostname(const std::string& hostname)
+{
+	if (p) { p->hostname = hostname; }
+	return *this;
+}
+
 Bonjour& Bonjour::set_retries(unsigned retries)
 {
 	if (p && retries > 0) { p->retries = retries; }
@@ -788,6 +1076,12 @@ Bonjour& Bonjour::on_complete(CompleteFn fn)
 	return *this;
 }
 
+Bonjour& Bonjour::on_resolve(ResolveFn fn)
+{
+	if (p) { p->resolvefn = std::move(fn); }
+	return *this;
+}
+
 Bonjour::Ptr Bonjour::lookup()
 {
 	auto self = std::make_shared<Bonjour>(std::move(*this));
@@ -803,4 +1097,26 @@ Bonjour::Ptr Bonjour::lookup()
 }
 
 
+Bonjour::Ptr Bonjour::resolve()
+{
+	auto self = std::make_shared<Bonjour>(std::move(*this));
+
+	if (self->p) {
+		auto io_thread = std::thread([self]() {
+			self->p->resolve_perform();
+			});
+		self->p->io_thread = std::move(io_thread);
+	}
+
+	return self;
 }
+
+void Bonjour::resolve_sync()
+{
+	if (p)
+		p->resolve_perform();
+}
+
+
+}
+
