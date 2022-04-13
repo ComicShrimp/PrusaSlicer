@@ -38,6 +38,8 @@ protected:
     virtual bool validate_version_text(const boost::optional<std::string> &version_text) const;
 #ifdef WIN32
     virtual bool upload_inner(PrintHostUpload upload_data, ProgressFn prorgess_fn, ErrorFn error_fn, const std::vector<boost::asio::ip::address>& resolved_addr) const;
+    virtual bool upload_inner_with_host(PrintHostUpload upload_data, ProgressFn prorgess_fn, ErrorFn error_fn) const;
+    virtual bool test_with_resolved_ip(wxString& curl_msg) const;
 #endif
 
 private:

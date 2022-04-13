@@ -104,8 +104,7 @@ OctoPrint::OctoPrint(DynamicPrintConfig *config) :
 
 const char* OctoPrint::get_name() const { return "OctoPrint"; }
 
-#ifdef WIN32
-bool OctoPrint::test(wxString &msg) const
+bool OctoPrint::test_with_resolved_ip(wxString &msg) const
 {
     // Since the request is performed synchronously here,
    // it is ok to refer to `msg` from within the closure
@@ -157,7 +156,7 @@ bool OctoPrint::test(wxString &msg) const
 
     return res;
 }
-#else // !WIN32
+
 bool OctoPrint::test(wxString& msg) const
 {
     // Since the request is performed synchronously here,
@@ -201,11 +200,19 @@ bool OctoPrint::test(wxString& msg) const
                 msg = "Could not parse server response";
             }
         })
+#ifdef WIN32
+            .ssl_revoke_best_effort(m_ssl_revoke_best_effort)
+            .on_ip_resolve([&](std::string address) {
+            // Workaround for Windows 10/11 mDNS resolve issue, where two mDNS resolves in succession fail.
+            // Remember resolved address to be reused at successive REST API call.
+            msg = GUI::from_u8(address);
+        })
+#endif // WIN32
         .perform_sync();
 
     return res;
 }
-#endif
+
 
 wxString OctoPrint::get_test_ok_msg () const
 {
@@ -220,10 +227,12 @@ wxString OctoPrint::get_test_failed_msg (wxString &msg) const
         % _utf8(L("Note: OctoPrint version at least 1.1.0 is required."))).str());
 }
 
-#ifdef WIN32
 bool OctoPrint::upload(PrintHostUpload upload_data, ProgressFn prorgess_fn, ErrorFn error_fn) const
 {
-  
+#ifndef WIN32
+    return upload_inner_with_host(upload_data, prorgess_fn, error_fn);
+#endif // !WIN32
+
     // decide what to do based on m_host - resolve hostname or upload to ip
     std::vector<boost::asio::ip::address> resolved_addr;
     boost::system::error_code ec;
@@ -231,10 +240,9 @@ bool OctoPrint::upload(PrintHostUpload upload_data, ProgressFn prorgess_fn, Erro
     if (!ec) {
         resolved_addr.push_back(host_ip);
     } else {
-        bool retval = false;
         Bonjour("octoprint")
             .set_hostname(m_host)
-            .set_retries(3)
+            .set_retries(10)
             .set_timeout(1)
             .on_resolve([&ra = resolved_addr](const std::vector<BonjourReply>& replies) {
                 std::vector<boost::asio::ip::address> resolved_addr;
@@ -255,6 +263,8 @@ bool OctoPrint::upload(PrintHostUpload upload_data, ProgressFn prorgess_fn, Erro
             })
             .resolve_sync();
     }
+    if (resolved_addr.empty())
+        return upload_inner_with_host(upload_data, prorgess_fn, error_fn);
     return upload_inner(upload_data, prorgess_fn, error_fn, resolved_addr);
 }
 bool OctoPrint::upload_inner(PrintHostUpload upload_data, ProgressFn prorgess_fn, ErrorFn error_fn, const std::vector<boost::asio::ip::address>& resolved_addr) const
@@ -267,7 +277,7 @@ bool OctoPrint::upload_inner(PrintHostUpload upload_data, ProgressFn prorgess_fn
 
         // test_msg will contain already resolved ip and will be cleared on start of test()
         wxString test_msg_or_host_ip = GUI::from_u8(ip.to_string());
-        if (!test(test_msg_or_host_ip)) {
+        if (!test_with_resolved_ip(test_msg_or_host_ip)) {
             // todo: copy error msg for later
             //error_fn(std::move(test_msg_or_host_ip));
             //return false;
@@ -317,13 +327,11 @@ bool OctoPrint::upload_inner(PrintHostUpload upload_data, ProgressFn prorgess_fn
         if (result)
             return true;             
     }
-
+    // todo: failed. Should we try again with host?
     return false;
 }
 
-#else
-
-bool OctoPrint::upload(PrintHostUpload upload_data, ProgressFn prorgess_fn, ErrorFn error_fn) const
+bool OctoPrint::upload_inner_with_host(PrintHostUpload upload_data, ProgressFn prorgess_fn, ErrorFn error_fn) const
 {
     const char* name = get_name();
 
@@ -399,7 +407,6 @@ bool OctoPrint::upload(PrintHostUpload upload_data, ProgressFn prorgess_fn, Erro
 
     return res;
 }
-#endif
 
 bool OctoPrint::validate_version_text(const boost::optional<std::string> &version_text) const
 {
