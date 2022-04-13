@@ -258,6 +258,7 @@ struct DnsRR_AAAA
 	enum { TAG = 0x1c };
 
 	asio::ip::address_v6 ip;
+	std::string name;
 
 	static void decode(optional<DnsRR_AAAA> &result, const DnsResource &rr)
 	{
@@ -403,7 +404,7 @@ struct DnsMessage
 	optional<DnsRR_AAAA> rr_aaaa;
 	std::vector<DnsRR_SRV> rr_srv;
 
-	optional<DnsResource> answer;
+	//optional<DnsResource> answer;
 
 	DnsSDMap sdmap;
 
@@ -445,13 +446,14 @@ private:
 		switch (rr.type) {
 			case DnsRR_A::TAG: 
 				DnsRR_A::decode(this->rr_a, rr); 
-				// todo: save name to rr_a
-				this->answer = rr; 
+				this->rr_a->name = rr.name;
+				//this->answer = rr; 
 				break;
 			case DnsRR_AAAA::TAG: 
 				// todo: save name to rr_aaaa
 				DnsRR_AAAA::decode(this->rr_aaaa, rr); 
-				this->answer = rr; 
+				this->rr_aaaa->name = rr.name;
+				//this->answer = rr; 
 				break;
 			case DnsRR_SRV::TAG: {
 				auto srv = DnsRR_SRV::decode(buffer, rr, dataoffset);
@@ -892,10 +894,11 @@ void UdpSession::handle_receive(const error_code& error, size_t bytes)
 		if (socket->get_query_type() == DnsRR_A::TAG && dns_msg->rr_a) { ip = dns_msg->rr_a->ip; }
 		else if (socket->get_query_type() == DnsRR_AAAA::TAG && dns_msg->rr_aaaa) { ip = dns_msg->rr_aaaa->ip; }
 		else return; // not matching query type with answer type
-		// recieved answer for resolve (A or AAAA querry)
-		if (dns_msg->answer && (dns_msg->answer->type == socket->get_query_type())) {
-			// transform both strings to lower. Shloud we really do it?
-			std::string name_tolower = dns_msg->answer->name;
+		// recieved answer for resolve (A or AAAA querry), rr_a/aaaa should have name attribute filled
+		std::string answer_name = socket->get_query_type() == DnsRR_A::TAG ? dns_msg->rr_a->name : dns_msg->rr_aaaa->name;
+		if (!answer_name.empty()) {
+			// transform both strings to lower. Should we really do it?
+			std::string name_tolower = answer_name;
 			std::transform(name_tolower.begin(), name_tolower.end(), name_tolower.begin(),
 				[](unsigned char c) { return std::tolower(c); });
 			std::string hostname_tolower = socket->get_hostname();
@@ -903,7 +906,7 @@ void UdpSession::handle_receive(const error_code& error, size_t bytes)
 				[](unsigned char c) { return std::tolower(c); });
 
 			if (name_tolower == hostname_tolower) {
-				BonjourReply reply(ip, 0, std::string(), dns_msg->answer.get().name, BonjourReply::TxtData());
+				BonjourReply reply(ip, 0, std::string(), answer_name, BonjourReply::TxtData());
 				replyfn(std::move(reply));
 			}
 		}

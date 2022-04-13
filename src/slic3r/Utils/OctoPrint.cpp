@@ -247,7 +247,6 @@ bool OctoPrint::upload(PrintHostUpload upload_data, ProgressFn prorgess_fn, Erro
                     boost::asio::ip::address ip(rpl.ip);
                     ra.emplace_back(ip);
                 }
-                
             })
             .resolve_sync();
     }
