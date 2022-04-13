@@ -14,6 +14,7 @@
 #include <boost/date_time/posix_time/posix_time_duration.hpp>
 #include <boost/format.hpp>
 #include <boost/thread.hpp>
+#include <boost/enable_shared_from_this.hpp>
 
 using boost::optional;
 using boost::system::error_code;
@@ -651,6 +652,7 @@ struct Bonjour::priv
 //	void udp_receive_resolve(udp::endpoint from, size_t bytes);
 	void lookup_perform();
 	void resolve_perform();
+	void resolve_perform_parallel();
 };
 
 Bonjour::priv::priv(std::string &&service)
@@ -771,7 +773,7 @@ void Bonjour::priv::lookup_perform()
 	} catch (std::exception& /* e */) {
 	}
 }
-
+/*
 class ResolveSocket
 {
 private:
@@ -872,6 +874,8 @@ void ResolveSocket::receive_handler(const error_code& error, size_t bytes)
 void ResolveSocket::send()
 {
 	try {
+		BOOST_LOG_TRIVIAL(error) << "send";
+
 		const auto brq = query_type == DnsRR_A::TAG ? BonjourRequest::make_A(hostname) : BonjourRequest::make_AAAA(hostname);
 		socket.send_to(asio::buffer(brq->data), mcast_endpoint);
 	}
@@ -883,7 +887,8 @@ void ResolveSocket::send()
 void ResolveSocket::async_recieve(boost::shared_ptr< boost::asio::io_service::strand > strand)
 {
 	try {
-		
+		BOOST_LOG_TRIVIAL(error) << "async_recieve";
+
 		buffer.resize(DnsMessage::MAX_SIZE);
 		socket.async_receive_from(asio::buffer(buffer, buffer.size()), recv_endpoint, strand->wrap(boost::bind(&ResolveSocket::receive_handler, this, _1 , _2)));
 	}
@@ -915,9 +920,9 @@ void Bonjour::priv::resolve_perform()
 
 	std::vector<ResolveSocket*> resolvers;
 	resolvers.emplace_back(new ResolveSocket(hostname, reply_callback, BonjourRequest::MCAST_IP4, DnsRR_A::TAG, io_service));
-	resolvers.emplace_back(new ResolveSocket(hostname, reply_callback, MCAST_IP6, DnsRR_AAAA::TAG, io_service));
-	resolvers.emplace_back(new ResolveSocket(hostname, reply_callback, BonjourRequest::MCAST_IP4, DnsRR_AAAA::TAG, io_service));
-	resolvers.emplace_back(new ResolveSocket(hostname, reply_callback, MCAST_IP6, DnsRR_A::TAG, io_service));
+	//resolvers.emplace_back(new ResolveSocket(hostname, reply_callback, MCAST_IP6, DnsRR_AAAA::TAG, io_service));
+	//resolvers.emplace_back(new ResolveSocket(hostname, reply_callback, BonjourRequest::MCAST_IP4, DnsRR_AAAA::TAG, io_service));
+	//resolvers.emplace_back(new ResolveSocket(hostname, reply_callback, MCAST_IP6, DnsRR_A::TAG, io_service));
 
 	auto self = this;
 	try{
@@ -931,7 +936,7 @@ void Bonjour::priv::resolve_perform()
 		retries--;
 		std::function<void(const error_code&)> timer_handler = [&](const error_code& error) {
 			// end 
-			if (retries == 0 || error || /*!replies.empty() ||*/ replies.size() > 2 ) {
+			if (retries == 0 || error || !replies.empty() ) {
 				//BOOST_LOG_TRIVIAL(error) << retries;
 				expired = true;
 				if (self->resolvefn) {
@@ -939,10 +944,9 @@ void Bonjour::priv::resolve_perform()
 				}
 			// restart timer
 			} else {
-				//BOOST_LOG_TRIVIAL(error) << retries << " " << replies.size();
+				BOOST_LOG_TRIVIAL(error) << retries << " " << replies.size();
 				retry = true;
 				retries--;
-				BOOST_LOG_TRIVIAL(error) << retries;
 				timer.expires_from_now(boost::posix_time::seconds(timeout));
 				//timer.async_wait(strand->wrap(timer_handler));
 				timer.async_wait(timer_handler);
@@ -979,6 +983,214 @@ void Bonjour::priv::resolve_perform()
 		BOOST_LOG_TRIVIAL(error) << e.what();
 	}
 }
+*/
+
+class ResolveSocket;
+
+struct UdpSession : boost::enable_shared_from_this<UdpSession>{
+
+	UdpSession(ResolveSocket* sckt, Bonjour::ReplyFn rfn) : socket(sckt), replyfn(rfn) 
+	{
+		buffer.resize(DnsMessage::MAX_SIZE);
+	}
+
+	void handle_receive(const error_code& error, size_t bytes);
+
+	udp::endpoint remote_endpoint;
+	std::vector<char> buffer;
+	ResolveSocket* socket;
+	Bonjour::ReplyFn replyfn;
+};
+
+class ResolveSocket
+{
+private:
+	typedef boost::shared_ptr<UdpSession> SharedSession;
+	Bonjour::ReplyFn replyfn; // this doesnt call same fn as replyfn of Bonjour class
+	asio::ip::address multicast_address;
+	udp::socket socket;
+	udp::endpoint mcast_endpoint;
+	boost::shared_ptr< boost::asio::io_service > io_service;
+	std::vector<char> buffer;
+public:
+	ResolveSocket(const std::string& hostname, Bonjour::ReplyFn replyfn, const asio::ip::address& multicast_address, uint16_t query_type, boost::shared_ptr< boost::asio::io_service > io_service);
+
+	void send();
+	void async_receive();
+	void cancel() { socket.cancel(); }
+	// todo: getters
+	std::string hostname;
+	uint16_t query_type; // DnsRR_A::TAG or DnsRR_AAAA::TAG
+private:
+	void receive_handler(SharedSession session, const error_code& error, size_t bytes);
+};
+
+ResolveSocket::ResolveSocket(const std::string& hostname, Bonjour::ReplyFn replyfn, const asio::ip::address& multicast_address, uint16_t query_type, boost::shared_ptr< boost::asio::io_service > io_service)
+	: hostname(hostname)
+	, replyfn(replyfn)
+	, multicast_address(multicast_address)
+	, query_type(query_type)
+	, socket(*io_service)
+	, io_service(io_service)
+{
+	try {
+		// open socket
+		boost::asio::ip::udp::endpoint listen_endpoint(multicast_address.is_v4() ? udp::v4() : udp::v6(), BonjourRequest::MCAST_PORT);
+		socket.open(listen_endpoint.protocol());
+		// set socket to listen
+		socket.set_option(udp::socket::reuse_address(true));
+		socket.bind(listen_endpoint);
+		socket.set_option(boost::asio::ip::multicast::join_group(multicast_address));
+		mcast_endpoint = udp::endpoint(multicast_address, BonjourRequest::MCAST_PORT);
+	}
+	catch (std::exception& e) {
+		BOOST_LOG_TRIVIAL(error) << e.what();
+	}
+}
+
+void ResolveSocket::receive_handler(SharedSession session, const error_code& error, size_t bytes)
+{
+	io_service->post(bind(&UdpSession::handle_receive, session, error, bytes));
+	// immediately accept new datagrams
+	async_receive();
+}
+
+void ResolveSocket::send()
+{
+	try {
+		const auto brq = query_type == DnsRR_A::TAG ? BonjourRequest::make_A(hostname) : BonjourRequest::make_AAAA(hostname);
+		socket.send_to(asio::buffer(brq->data), mcast_endpoint);
+		// should we care if this is called while already receiving? (async_receive call from receive_handler)
+		async_receive();
+	}
+	catch (std::exception& e) {
+		BOOST_LOG_TRIVIAL(error) << e.what();
+	}
+}
+
+void ResolveSocket::async_receive()
+{
+	try {
+		// our session to hold the buffer + endpoint
+		auto session = boost::make_shared<UdpSession>(this, replyfn);
+		socket.async_receive_from(asio::buffer(session->buffer, session->buffer.size())
+			, session->remote_endpoint
+			, boost::bind(&ResolveSocket::receive_handler, this, session, asio::placeholders::error, asio::placeholders::bytes_transferred));
+	}
+	catch (std::exception& e) {
+		BOOST_LOG_TRIVIAL(error) << e.what();
+	}
+}
+
+void UdpSession::handle_receive(const error_code& error, size_t bytes)
+{
+	if (error) {
+		// todo: what level? do we even log? There is lot of callbacks when timer runs out
+		BOOST_LOG_TRIVIAL(error) << error.message();
+		return;
+	}
+	if (bytes == 0 || !replyfn) {
+		// todo: log something?
+		return;
+	}
+
+	buffer.resize(bytes);
+	// decode buffer, txt keys are not needed for A / AAAA answer
+	auto dns_msg = DnsMessage::decode(buffer, Bonjour::TxtKeys());
+	if (dns_msg) {
+		asio::ip::address ip;// = from.address();
+		if (socket->query_type == DnsRR_A::TAG && dns_msg->rr_a) { ip = dns_msg->rr_a->ip; }
+		else if (socket->query_type == DnsRR_AAAA::TAG && dns_msg->rr_aaaa) { ip = dns_msg->rr_aaaa->ip; }
+		else return; // not matching query type with answer type
+		// recieved answer for resolve (A or AAAA querry)
+		if (dns_msg->answer && (dns_msg->answer->type == socket->query_type)) {
+			// transform both strings to lower. Shloud we really do it?
+			std::string name_tolower = dns_msg->answer->name;
+			std::transform(name_tolower.begin(), name_tolower.end(), name_tolower.begin(),
+				[](unsigned char c) { return std::tolower(c); });
+			std::string hostname_tolower = socket->hostname;
+			std::transform(hostname_tolower.begin(), hostname_tolower.end(), hostname_tolower.begin(),
+				[](unsigned char c) { return std::tolower(c); });
+
+			if (name_tolower == hostname_tolower) {
+				BonjourReply reply(ip, 0, std::string(), dns_msg->answer.get().name, BonjourReply::TxtData(), buffer);
+				replyfn(std::move(reply));
+			}
+		}
+	}
+}
+
+void Bonjour::priv::resolve_perform()
+{
+	// reply callback is shared to every UDPSession which is called asyn 
+	boost::mutex replies_guard;
+	std::vector<BonjourReply> replies;
+	const auto reply_callback = [&rpls = replies, &guard = replies_guard](BonjourReply&& reply)
+	{
+		guard.lock();
+		if (std::find(rpls.begin(), rpls.end(), reply) == rpls.end())
+			rpls.push_back(reply);
+		guard.unlock();
+	};
+	// todo: why here and v6 in BonjourRequest?
+	const asio::ip::address_v6 MCAST_IP6 = asio::ip::make_address_v6("ff02::fb");
+
+	boost::shared_ptr< boost::asio::io_service > io_service(
+		new boost::asio::io_service
+	);
+
+	std::vector<ResolveSocket*> resolvers;
+	resolvers.emplace_back(new ResolveSocket(hostname, reply_callback, BonjourRequest::MCAST_IP4, DnsRR_A::TAG, io_service));
+	resolvers.emplace_back(new ResolveSocket(hostname, reply_callback, MCAST_IP6, DnsRR_AAAA::TAG, io_service));
+	resolvers.emplace_back(new ResolveSocket(hostname, reply_callback, BonjourRequest::MCAST_IP4, DnsRR_AAAA::TAG, io_service));
+	resolvers.emplace_back(new ResolveSocket(hostname, reply_callback, MCAST_IP6, DnsRR_A::TAG, io_service));
+
+
+	auto self = this;
+	try {
+		// send first queries
+		for each (auto * resolver in resolvers)
+			resolver->send();
+
+		// timer settings
+		asio::deadline_timer timer(*io_service);
+		retries--;
+		std::function<void(const error_code&)> timer_handler = [&](const error_code& error) {
+			replies_guard.lock();
+			int replies_count = replies.size();
+			replies_guard.unlock();
+			// end 
+			if (retries == 0 || error || replies_count > 0) {
+				// is this correct ending?
+				io_service->stop();
+				replies_guard.lock();
+				if (self->resolvefn) {
+					self->resolvefn(replies);
+				}
+				replies_guard.unlock();
+			// restart timer
+			} else {
+				BOOST_LOG_TRIVIAL(error) << retries << " " << replies_count;
+				retries--;
+				timer.expires_from_now(boost::posix_time::seconds(timeout));
+				timer.async_wait(timer_handler);
+				// trigger another round of queries
+				for each (auto * resolver in resolvers)
+					resolver->send();
+			}
+		};
+		// start timer
+		timer.expires_from_now(boost::posix_time::seconds(timeout));
+		timer.async_wait(timer_handler);
+		// start io_service, it will run until it has something to do - so in this case until stop is called in timer
+		io_service->run();
+		BOOST_LOG_TRIVIAL(error) << "run finished";
+	}
+	catch (std::exception& e) {
+		BOOST_LOG_TRIVIAL(error) << e.what();
+	}
+}
+
 
 // API - public part
 

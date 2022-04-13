@@ -240,6 +240,7 @@ bool OctoPrint::upload(PrintHostUpload upload_data, ProgressFn prorgess_fn, Erro
     if (!ec) {
         resolved_addr.push_back(host_ip);
     } else {
+        // todo: do not resolve if disabled in preferences
         Bonjour("octoprint")
             .set_hostname(m_host)
             .set_retries(10)
