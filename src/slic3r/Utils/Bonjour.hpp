@@ -25,15 +25,12 @@ struct BonjourReply
 
 	TxtData txt_data;
 
-	std::vector<char> buffer;
-
 	BonjourReply() = delete;
 	BonjourReply(boost::asio::ip::address ip,
 		uint16_t port,
 		std::string service_name,
 		std::string hostname,
-		TxtData txt_data,
-		const std::vector<char>& buffer);
+		TxtData txt_data);
 
 	std::string path() const;
 
@@ -77,9 +74,11 @@ public:
 	Bonjour& on_complete(CompleteFn fn);
 
 	Bonjour& on_resolve(ResolveFn fn);
-
+	// lookup all devices by given TxtKeys
+	// each correct reply is passed back in ReplyFn, finishes with CompleteFn
 	Ptr lookup();
-	// alternative to lookup, sends query with hostname
+	// performs resolving of hostname into vector of ip adresses passed back by ResolveFn
+	// needs set_hostname and on_resolve to be called before.
 	Ptr resolve();
 	// resolve on the current thread
 	void resolve_sync();
