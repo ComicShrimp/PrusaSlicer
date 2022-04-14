@@ -569,21 +569,19 @@ optional<BonjourRequest> BonjourRequest::make_A(const std::string& hostname)
 		0x00, 0x00, // Flags
 		0x00, 0x01, // One query
 		0x00, 0x00, 0x00, 0x00, 0x00, 0x00   // Zero Answer, Authority, and Additional RRs
-		, 0x10 // todo why?
 	};
 	std::copy(rq_meta, rq_meta + sizeof(rq_meta), std::back_inserter(data));
 
-	// Add A query name
-	//data.push_back(hostname.size() + 1);
-	// trimming .local bad way for now
-	data.insert(data.end(), hostname.begin(), hostname.end() - 6);
+	// Add hostname without .local
+	data.push_back(hostname.size());
+	data.insert(data.end(), hostname.begin(), hostname.end());
 	
 	// Add the rest of A record
 	static const unsigned char ptr_tail[] = {
-		0x05, // length of "label"
-		0x6c, 0x6f, 0x63, 0x61, 0x6c, // "label" string and terminator
-		0x00, 0x00, 0x01, // Type A
-		0x00, 0x01, // Class - 1 is internet 0xff is any
+		0x05, // length of "local"
+		0x6c, 0x6f, 0x63, 0x61, 0x6c, 0x00,// "local" string and terminator
+		0x00, 0x01, // Type A
+		0x00, 0xff, // Class - 01 is internet 0xff is any
 	};
 	std::copy(ptr_tail, ptr_tail + sizeof(ptr_tail), std::back_inserter(data));
 
@@ -606,21 +604,19 @@ optional<BonjourRequest> BonjourRequest::make_AAAA(const std::string& hostname)
 		0x00, 0x00, // Flags
 		0x00, 0x01, // One query
 		0x00, 0x00, 0x00, 0x00, 0x00, 0x00   // Zero Answer, Authority, and Additional RRs
-		, 0x10
 	};
 	std::copy(rq_meta, rq_meta + sizeof(rq_meta), std::back_inserter(data));
 
-	// Add A query name
-	//data.push_back(hostname.size() + 1);
-	// trimming .local bad way for now
-	data.insert(data.end(), hostname.begin(), hostname.end() - 6);
+	// Add hostname without .local
+	data.push_back(hostname.size());
+	data.insert(data.end(), hostname.begin(), hostname.end());
 
 	// Add the rest of A record
 	static const unsigned char ptr_tail[] = {
-		0x05, // length of "label"
-		0x6c, 0x6f, 0x63, 0x61, 0x6c, // "label" string and terminator
-		0x00, 0x00, 0x1c, // Type AAAA
-		0x00, 0x01, // Class - 1 is internet 0xff is any // todo: which class?
+		0x05, // length of "local"
+		0x6c, 0x6f, 0x63, 0x61, 0x6c, 0x00, // "local" string and terminator
+		0x00, 0x1c, // Type AAAA
+		0x00, 0xff, // Class - 01 is internet 0xff is any 
 	};
 	std::copy(ptr_tail, ptr_tail + sizeof(ptr_tail), std::back_inserter(data));
 
@@ -805,6 +801,7 @@ private:
 	boost::shared_ptr< boost::asio::io_service > io_service;
 	std::string hostname;
 	uint16_t query_type;  // DnsRR_A::TAG or DnsRR_AAAA::TAG
+	boost::optional<BonjourRequest> request;
 public:
 	ResolveSocket(const std::string& hostname, Bonjour::ReplyFn replyfn, const asio::ip::address& multicast_address, uint16_t query_type, boost::shared_ptr< boost::asio::io_service > io_service);
 
@@ -850,8 +847,15 @@ void ResolveSocket::receive_handler(SharedSession session, const error_code& err
 void ResolveSocket::send()
 {
 	try {
-		const auto brq = query_type == DnsRR_A::TAG ? BonjourRequest::make_A(hostname) : BonjourRequest::make_AAAA(hostname);
-		socket.send_to(asio::buffer(brq->data), mcast_endpoint);
+		if (!request) {
+			// BonjourRequest::make_A / AAAA is now implemented to add .local correctly after the hostname.
+			// If that is unsufficient, we need to change make_A / AAAA and pass full hostname.
+			std::string trimmed_hostname = hostname;
+			if (size_t dot_pos = trimmed_hostname.find_first_of('.'); dot_pos != std::string::npos)
+				trimmed_hostname = trimmed_hostname.substr(0, dot_pos);
+			request = query_type == DnsRR_A::TAG ? BonjourRequest::make_A(trimmed_hostname) : BonjourRequest::make_AAAA(trimmed_hostname);
+		}
+		socket.send_to(asio::buffer(request->data), mcast_endpoint);
 		// Should we care if this is called while already receiving? (async_receive call from receive_handler)
 		async_receive();
 	}
@@ -895,7 +899,7 @@ void UdpSession::handle_receive(const error_code& error, size_t bytes)
 		else if (socket->get_query_type() == DnsRR_AAAA::TAG && dns_msg->rr_aaaa) { ip = dns_msg->rr_aaaa->ip; }
 		else return; // not matching query type with answer type
 		// recieved answer for resolve (A or AAAA querry), rr_a/aaaa should have name attribute filled
-		std::string answer_name = socket->get_query_type() == DnsRR_A::TAG ? dns_msg->rr_a->name : dns_msg->rr_aaaa->name;
+		std::string answer_name = (socket->get_query_type() == DnsRR_A::TAG ? dns_msg->rr_a->name : dns_msg->rr_aaaa->name);
 		if (!answer_name.empty()) {
 			// transform both strings to lower. Should we really do it?
 			std::string name_tolower = answer_name;
@@ -904,7 +908,6 @@ void UdpSession::handle_receive(const error_code& error, size_t bytes)
 			std::string hostname_tolower = socket->get_hostname();
 			std::transform(hostname_tolower.begin(), hostname_tolower.end(), hostname_tolower.begin(),
 				[](unsigned char c) { return std::tolower(c); });
-
 			if (name_tolower == hostname_tolower) {
 				BonjourReply reply(ip, 0, std::string(), answer_name, BonjourReply::TxtData());
 				replyfn(std::move(reply));
